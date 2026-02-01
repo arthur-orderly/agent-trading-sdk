@@ -3,7 +3,7 @@
 Basic trading example with Arthur SDK.
 """
 
-from arthur import Arthur
+from orderly_agent import Arthur
 
 
 def main():

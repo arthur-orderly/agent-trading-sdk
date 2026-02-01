@@ -6,14 +6,14 @@ with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
 setup(
-    name="arthur-sdk",
+    name="agent-trading-sdk",
     version="0.1.0",
     author="Arthur",
-    author_email="arthur@orderly.network",
+    author_email="dev@orderly.network",
     description="Simple trading for AI agents on Orderly Network",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/ranyi1115/arthur-sdk",
+    url="https://github.com/anthropic/agent-trading-sdk",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -41,7 +41,7 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "arthur=arthur.cli:main",
+            "orderly-agent=orderly_agent.cli:main",
         ],
     },
 )

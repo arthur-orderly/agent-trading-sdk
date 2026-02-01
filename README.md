@@ -1,4 +1,4 @@
-# Arthur SDK
+# Agent Trading SDK
 
 **Simple trading for AI agents on Orderly Network.**
 
@@ -7,13 +7,13 @@ No complex signatures. No confusing structs. Just trade.
 ## Installation
 
 ```bash
-pip install arthur-sdk
+pip install agent-trading-sdk
 ```
 
 ## Quick Start
 
 ```python
-from arthur import Arthur
+from orderly_agent import Arthur
 
 # Initialize with credentials
 client = Arthur(
@@ -176,7 +176,7 @@ client = Arthur(
 ## Error Handling
 
 ```python
-from arthur import Arthur, OrderError, InsufficientFundsError
+from orderly_agent import Arthur, OrderError, InsufficientFundsError
 
 try:
     client.buy("ETH", usd=100)

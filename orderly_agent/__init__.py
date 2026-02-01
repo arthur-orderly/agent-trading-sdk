@@ -1,14 +1,14 @@
 """
-Arthur SDK - Simple trading for AI agents on Orderly Network.
+Agent Trading SDK - Simple trading for AI agents on Orderly Network.
 
 Usage:
-    from arthur import Arthur
+    from orderly_agent import Arthur
     
     client = Arthur(api_key="your_key")
     client.buy("ETH", usd=100)
     
     # Or run strategies
-    from arthur import StrategyRunner
+    from orderly_agent import StrategyRunner
     runner = StrategyRunner(client)
     runner.run("strategy.json")
 """
