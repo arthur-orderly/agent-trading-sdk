@@ -1,12 +1,13 @@
 """
-Arthur SDK Strategy Runner - Execute trading strategies from JSON configs.
+Agent Trading SDK Strategy Runner - Execute trading strategies from JSON configs.
 
-This replaces ATP (Agent Trading Protocol) executor with a cleaner Python implementation.
+Supports both simple single-symbol and multi-asset strategies (like Unlockoor).
 """
 
 import json
 import time
-from dataclasses import dataclass
+import urllib.request
+from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Any, Callable, Union
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from .exceptions import ArthurError
 @dataclass
 class Signal:
     """Trading signal from strategy evaluation"""
-    action: str  # "buy", "sell", "close", "hold"
+    action: str  # "long", "short", "close", "hold"
     symbol: str
     size: Optional[float] = None
     usd: Optional[float] = None
@@ -27,30 +28,35 @@ class Signal:
 
 @dataclass
 class StrategyConfig:
-    """Strategy configuration loaded from JSON"""
+    """Strategy configuration loaded from JSON - supports both simple and multi-asset formats"""
     name: str
-    symbol: str
-    timeframe: str
-    position_size_usd: float
-    max_positions: int = 1
-    leverage: int = 5
+    version: str = "1.0.0"
+    description: str = ""
     
-    # Entry conditions
-    entry_long: Optional[Dict] = None
-    entry_short: Optional[Dict] = None
+    # Single symbol mode (simple strategies)
+    symbol: Optional[str] = None
     
-    # Exit conditions  
-    exit_long: Optional[Dict] = None
-    exit_short: Optional[Dict] = None
+    # Multi-asset mode (Unlockoor-style)
+    long_assets: List[str] = field(default_factory=list)
+    short_assets: List[str] = field(default_factory=list)
+    
+    # Timeframe
+    timeframe: str = "4h"
+    
+    # Signals config
+    signals: Dict = field(default_factory=dict)
     
     # Risk management
-    stop_loss_pct: Optional[float] = None
-    take_profit_pct: Optional[float] = None
-    max_drawdown_pct: Optional[float] = None
+    risk: Dict = field(default_factory=dict)
     
-    # Filters
-    trading_hours: Optional[List[int]] = None  # UTC hours when trading allowed
-    min_volume_24h: Optional[float] = None
+    # Position sizing
+    position: Dict = field(default_factory=dict)
+    
+    # Execution settings
+    execution: Dict = field(default_factory=dict)
+    
+    # Flags
+    flags: Dict = field(default_factory=dict)
     
     @classmethod
     def from_file(cls, path: str) -> "StrategyConfig":
@@ -64,26 +70,69 @@ class StrategyConfig:
         """Create strategy from dict"""
         return cls(
             name=data.get("name", "Unnamed Strategy"),
-            symbol=data.get("symbol", "PERP_ETH_USDC"),
-            timeframe=data.get("timeframe", "4h"),
-            position_size_usd=data.get("position_size_usd", 100),
-            max_positions=data.get("max_positions", 1),
-            leverage=data.get("leverage", 5),
-            entry_long=data.get("entry_long"),
-            entry_short=data.get("entry_short"),
-            exit_long=data.get("exit_long"),
-            exit_short=data.get("exit_short"),
-            stop_loss_pct=data.get("stop_loss_pct"),
-            take_profit_pct=data.get("take_profit_pct"),
-            max_drawdown_pct=data.get("max_drawdown_pct"),
-            trading_hours=data.get("trading_hours"),
-            min_volume_24h=data.get("min_volume_24h"),
+            version=data.get("version", "1.0.0"),
+            description=data.get("description", ""),
+            symbol=data.get("symbol"),
+            long_assets=data.get("long_assets", []),
+            short_assets=data.get("short_assets", []),
+            timeframe=data.get("timeframe") or data.get("signals", {}).get("timeframe", "4h"),
+            signals=data.get("signals", {}),
+            risk=data.get("risk", {}),
+            position=data.get("position", {}),
+            execution=data.get("execution", {}),
+            flags=data.get("flags", {}),
         )
+    
+    @property
+    def all_symbols(self) -> List[str]:
+        """Get all tradeable symbols"""
+        if self.symbol:
+            return [self.symbol]
+        return list(set(self.long_assets + self.short_assets))
+    
+    @property
+    def is_multi_asset(self) -> bool:
+        """Check if this is a multi-asset strategy"""
+        return bool(self.long_assets or self.short_assets)
+    
+    @property
+    def leverage(self) -> int:
+        return self.position.get("leverage", 5)
+    
+    @property
+    def position_size_pct(self) -> float:
+        return self.position.get("size_pct", 10)
+    
+    @property
+    def stop_loss_pct(self) -> Optional[float]:
+        return self.risk.get("stop_loss_pct")
+    
+    @property
+    def take_profit_pct(self) -> Optional[float]:
+        return self.risk.get("take_profit_pct")
+    
+    @property
+    def max_positions(self) -> int:
+        return self.risk.get("max_positions", 5)
+    
+    @property
+    def dry_run(self) -> bool:
+        return self.flags.get("dry_run", False)
+    
+    @property
+    def allow_shorts(self) -> bool:
+        return self.flags.get("allow_shorts", True)
 
 
 class StrategyRunner:
     """
     Execute trading strategies on Orderly Network.
+    
+    Supports:
+    - Simple single-symbol strategies
+    - Multi-asset strategies (Unlockoor-style with long_assets/short_assets)
+    - RSI-based signals
+    - Risk management (stop loss, take profit)
     
     Example:
         client = Arthur.from_credentials_file("creds.json")
@@ -91,9 +140,6 @@ class StrategyRunner:
         
         # Run a strategy once
         result = runner.run("strategies/unlockoor.json")
-        
-        # Or run continuously
-        runner.run_loop("strategies/unlockoor.json", interval=60)
     """
     
     def __init__(
@@ -117,6 +163,8 @@ class StrategyRunner:
         self.on_signal = on_signal
         self.on_trade = on_trade
         self._last_run: Dict[str, float] = {}
+        self._rsi_cache: Dict[str, float] = {}
+        self._rsi_cache_time: float = 0
         
     def run(
         self,
@@ -143,11 +191,12 @@ class StrategyRunner:
         
         result = {
             "strategy": config.name,
-            "symbol": config.symbol,
+            "version": config.version,
             "timestamp": int(time.time() * 1000),
-            "signal": None,
-            "trade": None,
-            "error": None,
+            "signals": [],
+            "trades": [],
+            "errors": [],
+            "dry_run": self.dry_run or config.dry_run,
         }
         
         try:
@@ -157,56 +206,43 @@ class StrategyRunner:
                 result["reason"] = "Not time for next check"
                 return result
             
-            # Get current position
-            position = self.client.position(config.symbol)
+            # Get current positions
+            positions = {p.symbol: p for p in self.client.positions()}
             
-            # Evaluate strategy
-            signal = self._evaluate(config, position)
-            result["signal"] = signal.__dict__ if signal else None
+            # Multi-asset or single-symbol?
+            if config.is_multi_asset:
+                signals = self._evaluate_multi_asset(config, positions)
+            else:
+                signals = self._evaluate_single(config, positions)
             
-            if self.on_signal and signal:
-                self.on_signal(signal)
+            result["signals"] = [s.__dict__ for s in signals]
             
-            # Execute if we have a signal
-            if signal and signal.action != "hold":
-                if self.dry_run:
-                    result["dry_run"] = True
-                else:
-                    trade = self._execute(config, signal, position)
-                    result["trade"] = trade
-                    
-                    if self.on_trade and trade:
-                        self.on_trade(trade)
+            # Execute signals
+            for signal in signals:
+                if self.on_signal:
+                    self.on_signal(signal)
+                
+                if signal.action != "hold":
+                    if self.dry_run or config.dry_run:
+                        result["trades"].append({
+                            "action": signal.action,
+                            "symbol": signal.symbol,
+                            "dry_run": True,
+                            "reason": signal.reason,
+                        })
+                    else:
+                        trade = self._execute(config, signal, positions.get(signal.symbol))
+                        result["trades"].append(trade)
+                        
+                        if self.on_trade and trade:
+                            self.on_trade(trade)
             
             self._last_run[config.name] = time.time()
             
         except Exception as e:
-            result["error"] = str(e)
+            result["errors"].append(str(e))
             
         return result
-    
-    def run_loop(
-        self,
-        strategy: Union[str, StrategyConfig, Dict],
-        interval: int = 60,
-        max_runs: Optional[int] = None,
-    ):
-        """
-        Run strategy in a loop.
-        
-        Args:
-            strategy: Strategy to run
-            interval: Seconds between checks
-            max_runs: Stop after this many runs (None = forever)
-        """
-        runs = 0
-        while max_runs is None or runs < max_runs:
-            result = self.run(strategy, force=True)
-            print(f"[{time.strftime('%H:%M:%S')}] {result}")
-            
-            runs += 1
-            if max_runs is None or runs < max_runs:
-                time.sleep(interval)
     
     def _should_run(self, config: StrategyConfig) -> bool:
         """Check if enough time has passed since last run"""
@@ -225,38 +261,87 @@ class StrategyRunner:
         
         return time.time() - last >= interval
     
-    def _evaluate(
+    def _evaluate_multi_asset(
         self,
         config: StrategyConfig,
-        position: Optional[Position],
-    ) -> Optional[Signal]:
-        """
-        Evaluate strategy conditions and generate signal.
+        positions: Dict[str, Position],
+    ) -> List[Signal]:
+        """Evaluate a multi-asset strategy (Unlockoor-style)"""
+        signals = []
         
-        This is a simplified evaluator. For complex conditions,
-        override this method or use custom indicators.
-        """
-        symbol_short = config.symbol.replace("PERP_", "").replace("_USDC", "")
+        # Get RSI for all assets
+        rsi_values = self._get_rsi_batch(config.all_symbols, config.signals.get("period", 14))
         
-        # Check trading hours filter
-        if config.trading_hours:
-            current_hour = time.gmtime().tm_hour
-            if current_hour not in config.trading_hours:
-                return Signal(
-                    action="hold",
-                    symbol=config.symbol,
-                    reason=f"Outside trading hours (current: {current_hour} UTC)"
+        # Count current positions
+        current_position_count = len([p for p in positions.values() if p.size > 0])
+        
+        # Check long assets
+        for asset in config.long_assets:
+            symbol = self._normalize_symbol(asset)
+            rsi = rsi_values.get(symbol, 50)
+            position = positions.get(symbol)
+            
+            signal = self._evaluate_asset(
+                config=config,
+                symbol=symbol,
+                asset=asset,
+                rsi=rsi,
+                position=position,
+                side="long",
+                current_position_count=current_position_count,
+            )
+            signals.append(signal)
+            
+            if signal.action in ["long", "short"]:
+                current_position_count += 1
+        
+        # Check short assets
+        if config.allow_shorts:
+            for asset in config.short_assets:
+                symbol = self._normalize_symbol(asset)
+                rsi = rsi_values.get(symbol, 50)
+                position = positions.get(symbol)
+                
+                signal = self._evaluate_asset(
+                    config=config,
+                    symbol=symbol,
+                    asset=asset,
+                    rsi=rsi,
+                    position=position,
+                    side="short",
+                    current_position_count=current_position_count,
                 )
+                signals.append(signal)
+                
+                if signal.action in ["long", "short"]:
+                    current_position_count += 1
         
-        # If we have a position, check exit conditions
-        if position:
+        return signals
+    
+    def _evaluate_asset(
+        self,
+        config: StrategyConfig,
+        symbol: str,
+        asset: str,
+        rsi: float,
+        position: Optional[Position],
+        side: str,  # "long" or "short"
+        current_position_count: int,
+    ) -> Signal:
+        """Evaluate a single asset within a multi-asset strategy"""
+        
+        long_entry = config.signals.get("long_entry", 30)
+        short_entry = config.signals.get("short_entry", 70)
+        
+        # If we have a position, check for exit
+        if position and position.size > 0:
             # Check stop loss
             if config.stop_loss_pct:
                 if position.pnl_percent <= -config.stop_loss_pct:
                     return Signal(
                         action="close",
-                        symbol=config.symbol,
-                        reason=f"Stop loss hit: {position.pnl_percent:.1f}%"
+                        symbol=symbol,
+                        reason=f"Stop loss hit: {position.pnl_percent:.1f}% (limit: -{config.stop_loss_pct}%)",
                     )
             
             # Check take profit
@@ -264,68 +349,162 @@ class StrategyRunner:
                 if position.pnl_percent >= config.take_profit_pct:
                     return Signal(
                         action="close",
-                        symbol=config.symbol,
-                        reason=f"Take profit hit: {position.pnl_percent:.1f}%"
+                        symbol=symbol,
+                        reason=f"Take profit hit: {position.pnl_percent:.1f}% (target: +{config.take_profit_pct}%)",
                     )
             
-            # Check exit conditions based on position side
-            if position.side == "LONG" and config.exit_long:
-                if self._check_condition(config.exit_long):
-                    return Signal(
-                        action="close",
-                        symbol=config.symbol,
-                        reason="Exit long condition met"
-                    )
-            elif position.side == "SHORT" and config.exit_short:
-                if self._check_condition(config.exit_short):
-                    return Signal(
-                        action="close",
-                        symbol=config.symbol,
-                        reason="Exit short condition met"
-                    )
-        
-        else:
-            # No position - check entry conditions
-            if config.entry_long and self._check_condition(config.entry_long):
+            # Check RSI exit
+            if position.side == "LONG" and rsi >= 70:
                 return Signal(
-                    action="buy",
-                    symbol=config.symbol,
-                    usd=config.position_size_usd,
-                    reason="Entry long condition met"
+                    action="close",
+                    symbol=symbol,
+                    reason=f"RSI exit for long: {rsi:.1f} >= 70",
+                )
+            elif position.side == "SHORT" and rsi <= 30:
+                return Signal(
+                    action="close",
+                    symbol=symbol,
+                    reason=f"RSI exit for short: {rsi:.1f} <= 30",
                 )
             
-            if config.entry_short and self._check_condition(config.entry_short):
-                return Signal(
-                    action="sell",
-                    symbol=config.symbol,
-                    usd=config.position_size_usd,
-                    reason="Entry short condition met"
-                )
+            # Hold position
+            return Signal(
+                action="hold",
+                symbol=symbol,
+                reason=f"Holding {position.side} position, RSI={rsi:.1f}, PnL={position.pnl_percent:.1f}%",
+            )
         
+        # No position - check for entry
+        if current_position_count >= config.max_positions:
+            return Signal(
+                action="hold",
+                symbol=symbol,
+                reason=f"Max positions ({config.max_positions}) reached",
+            )
+        
+        # Entry signals
+        if side == "long" and rsi <= long_entry:
+            return Signal(
+                action="long",
+                symbol=symbol,
+                reason=f"Long entry: RSI {rsi:.1f} <= {long_entry}",
+                confidence=1.0 - (rsi / 100),  # Higher confidence at lower RSI
+            )
+        elif side == "short" and rsi >= short_entry:
+            return Signal(
+                action="short",
+                symbol=symbol,
+                reason=f"Short entry: RSI {rsi:.1f} >= {short_entry}",
+                confidence=rsi / 100,  # Higher confidence at higher RSI
+            )
+        
+        # No signal
         return Signal(
             action="hold",
-            symbol=config.symbol,
-            reason="No conditions met"
+            symbol=symbol,
+            reason=f"No entry signal: RSI={rsi:.1f} (long<={long_entry}, short>={short_entry})",
         )
     
-    def _check_condition(self, condition: Dict) -> bool:
-        """
-        Check if a condition is met.
+    def _evaluate_single(
+        self,
+        config: StrategyConfig,
+        positions: Dict[str, Position],
+    ) -> List[Signal]:
+        """Evaluate a simple single-symbol strategy"""
+        symbol = self._normalize_symbol(config.symbol or "ETH")
+        position = positions.get(symbol)
         
-        Simple implementation - extend for complex indicators.
-        Condition format: {"type": "always"} or {"type": "manual", "value": true}
-        """
-        cond_type = condition.get("type", "manual")
+        # Get RSI
+        rsi = self._get_rsi(symbol, config.signals.get("period", 14))
         
-        if cond_type == "always":
-            return True
-        elif cond_type == "never":
-            return False
-        elif cond_type == "manual":
-            return condition.get("value", False)
-        # Add more condition types as needed (RSI, MA cross, etc.)
+        signal = self._evaluate_asset(
+            config=config,
+            symbol=symbol,
+            asset=config.symbol or "ETH",
+            rsi=rsi,
+            position=position,
+            side="long",  # Default to long for simple strategies
+            current_position_count=len(positions),
+        )
         
-        return False
+        return [signal]
+    
+    def _normalize_symbol(self, symbol: str) -> str:
+        """Convert short symbol (ETH) to full symbol (PERP_ETH_USDC)"""
+        symbol = symbol.upper()
+        if symbol.startswith("PERP_"):
+            return symbol
+        return f"PERP_{symbol}_USDC"
+    
+    def _get_rsi(self, symbol: str, period: int = 14) -> float:
+        """Get RSI for a symbol using Orderly's TradingView history endpoint"""
+        try:
+            # Calculate time range (need period + buffer days)
+            now = int(time.time())
+            days_needed = period + 5
+            from_ts = now - (days_needed * 86400)
+            
+            # Use TV history endpoint
+            url = f"https://api-evm.orderly.org/tv/history?symbol={symbol}&resolution=1D&from={from_ts}&to={now}"
+            
+            with urllib.request.urlopen(url, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            
+            if data.get("s") != "ok" or "c" not in data:
+                return 50.0  # Default neutral RSI
+            
+            closes = data["c"]  # Already in chronological order
+            
+            if len(closes) < period + 1:
+                return 50.0
+            
+            # Calculate RSI
+            gains = []
+            losses = []
+            
+            for i in range(1, len(closes)):
+                change = closes[i] - closes[i-1]
+                if change > 0:
+                    gains.append(change)
+                    losses.append(0)
+                else:
+                    gains.append(0)
+                    losses.append(abs(change))
+            
+            if len(gains) < period:
+                return 50.0
+            
+            avg_gain = sum(gains[-period:]) / period
+            avg_loss = sum(losses[-period:]) / period
+            
+            if avg_loss == 0:
+                return 100.0
+            
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+            
+            return rsi
+            
+        except Exception as e:
+            print(f"Error getting RSI for {symbol}: {e}")
+            return 50.0  # Default neutral
+    
+    def _get_rsi_batch(self, symbols: List[str], period: int = 14) -> Dict[str, float]:
+        """Get RSI for multiple symbols"""
+        # Use cache if fresh (< 5 minutes)
+        if time.time() - self._rsi_cache_time < 300:
+            return self._rsi_cache
+        
+        result = {}
+        for symbol in symbols:
+            full_symbol = self._normalize_symbol(symbol)
+            result[full_symbol] = self._get_rsi(full_symbol, period)
+            time.sleep(0.15)  # Rate limit
+        
+        self._rsi_cache = result
+        self._rsi_cache_time = time.time()
+        
+        return result
     
     def _execute(
         self,
@@ -338,26 +517,25 @@ class StrategyRunner:
             "action": signal.action,
             "symbol": signal.symbol,
             "timestamp": int(time.time() * 1000),
+            "reason": signal.reason,
         }
         
         try:
-            # Set leverage first
-            self.client.set_leverage(config.symbol, config.leverage)
+            # Set leverage
+            self.client.set_leverage(signal.symbol, config.leverage)
             
-            if signal.action == "buy":
-                order = self.client.buy(
-                    signal.symbol,
-                    usd=signal.usd or config.position_size_usd,
-                )
+            # Calculate position size
+            balance = self.client.balance()
+            size_usd = balance * (config.position_size_pct / 100)
+            
+            if signal.action == "long":
+                order = self.client.buy(signal.symbol, usd=size_usd)
                 result["order_id"] = order.order_id
                 result["size"] = order.size
                 result["status"] = "executed"
                 
-            elif signal.action == "sell":
-                order = self.client.sell(
-                    signal.symbol,
-                    usd=signal.usd or config.position_size_usd,
-                )
+            elif signal.action == "short":
+                order = self.client.sell(signal.symbol, usd=size_usd)
                 result["order_id"] = order.order_id
                 result["size"] = order.size
                 result["status"] = "executed"
@@ -376,8 +554,7 @@ class StrategyRunner:
         return result
 
 
-# Convenience functions
-
+# Convenience function
 def run_strategy(
     strategy_path: str,
     credentials_path: str,
