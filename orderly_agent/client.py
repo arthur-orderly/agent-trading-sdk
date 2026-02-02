@@ -595,6 +595,246 @@ class Arthur:
             return resp["data"].get("cancelled_count", 0)
         return 0
     
+    # ==================== Market Making ====================
+    
+    def limit_buy(
+        self,
+        symbol: str,
+        price: float,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        post_only: bool = False,
+    ) -> Order:
+        """
+        Place a limit buy order.
+        
+        Args:
+            symbol: Token symbol
+            price: Limit price
+            size: Order size in base asset
+            usd: Order size in USD (alternative)
+            post_only: If True, order will only be maker (cancel if would take)
+            
+        Returns:
+            Order object
+        """
+        return self._place_limit_order(
+            symbol=symbol,
+            side="BUY",
+            price=price,
+            size=size,
+            usd=usd,
+            post_only=post_only,
+        )
+    
+    def limit_sell(
+        self,
+        symbol: str,
+        price: float,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        post_only: bool = False,
+    ) -> Order:
+        """
+        Place a limit sell order.
+        
+        Args:
+            symbol: Token symbol
+            price: Limit price
+            size: Order size in base asset
+            usd: Order size in USD (alternative)
+            post_only: If True, order will only be maker
+            
+        Returns:
+            Order object
+        """
+        return self._place_limit_order(
+            symbol=symbol,
+            side="SELL",
+            price=price,
+            size=size,
+            usd=usd,
+            post_only=post_only,
+        )
+    
+    def _place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        post_only: bool = False,
+        reduce_only: bool = False,
+    ) -> Order:
+        """Internal method to place a limit order"""
+        symbol = self._normalize_symbol(symbol)
+        
+        # Calculate size from USD if needed
+        if usd and not size:
+            size = usd / price  # Use limit price for size calc
+        
+        if not size:
+            raise OrderError("Must specify either size or usd")
+        
+        order_type = "POST_ONLY" if post_only else "LIMIT"
+        
+        order_data = {
+            "symbol": symbol,
+            "side": side,
+            "order_type": order_type,
+            "order_quantity": str(size),
+            "order_price": str(price),
+            "reduce_only": reduce_only,
+        }
+        
+        resp = self._request("POST", "/v1/order", data=order_data)
+        
+        if not resp.get("success"):
+            error = resp.get("message", "Unknown error")
+            if "insufficient" in error.lower():
+                raise InsufficientFundsError(error)
+            raise OrderError(error)
+        
+        data = resp["data"]
+        return Order(
+            order_id=str(data["order_id"]),
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            price=price,
+            size=size,
+            status=data.get("status", "NEW"),
+            created_at=int(time.time() * 1000),
+        )
+    
+    def orderbook(self, symbol: str, depth: int = 10) -> Dict[str, List]:
+        """
+        Get orderbook for a symbol.
+        
+        Args:
+            symbol: Token symbol
+            depth: Number of levels to return (default 10)
+            
+        Returns:
+            Dict with 'bids' and 'asks' lists of [price, size] pairs
+        """
+        symbol = self._normalize_symbol(symbol)
+        resp = self._request("GET", f"/v1/orderbook/{symbol}")
+        
+        if not resp.get("success"):
+            raise ArthurError(f"Failed to get orderbook for {symbol}")
+        
+        data = resp["data"]
+        
+        # Handle both formats: [{price, quantity}] or [[price, qty]]
+        def parse_levels(levels):
+            result = []
+            for level in levels[:depth]:
+                if isinstance(level, dict):
+                    result.append([float(level["price"]), float(level["quantity"])])
+                else:
+                    result.append([float(level[0]), float(level[1])])
+            return result
+        
+        return {
+            "bids": parse_levels(data.get("bids", [])),
+            "asks": parse_levels(data.get("asks", [])),
+            "timestamp": data.get("timestamp", int(time.time() * 1000)),
+        }
+    
+    def spread(self, symbol: str) -> Dict[str, float]:
+        """
+        Get current spread for a symbol.
+        
+        Args:
+            symbol: Token symbol
+            
+        Returns:
+            Dict with best_bid, best_ask, mid, spread_pct, spread_bps
+        """
+        ob = self.orderbook(symbol, depth=1)
+        
+        if not ob["bids"] or not ob["asks"]:
+            raise ArthurError(f"No orderbook data for {symbol}")
+        
+        best_bid = ob["bids"][0][0]
+        best_ask = ob["asks"][0][0]
+        mid = (best_bid + best_ask) / 2
+        spread_abs = best_ask - best_bid
+        spread_pct = (spread_abs / mid) * 100
+        spread_bps = spread_pct * 100
+        
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "spread": spread_abs,
+            "spread_pct": spread_pct,
+            "spread_bps": spread_bps,
+        }
+    
+    def get_order(self, order_id: str) -> Optional[Order]:
+        """
+        Get order by ID.
+        
+        Args:
+            order_id: Order ID
+            
+        Returns:
+            Order object or None if not found
+        """
+        resp = self._request("GET", f"/v1/order/{order_id}")
+        
+        if not resp.get("success"):
+            return None
+        
+        row = resp["data"]
+        return Order(
+            order_id=str(row["order_id"]),
+            symbol=row["symbol"],
+            side=row["side"],
+            order_type=row["type"],
+            price=float(row.get("price")) if row.get("price") else None,
+            size=float(row["quantity"]),
+            status=row["status"],
+            created_at=int(row["created_time"]),
+        )
+    
+    def quote(
+        self,
+        symbol: str,
+        bid_price: float,
+        ask_price: float,
+        size: float,
+        cancel_existing: bool = True,
+    ) -> Dict[str, Order]:
+        """
+        Place a two-sided quote (bid + ask).
+        
+        Args:
+            symbol: Token symbol
+            bid_price: Bid (buy) price
+            ask_price: Ask (sell) price
+            size: Size for each side
+            cancel_existing: Cancel existing orders first
+            
+        Returns:
+            Dict with 'bid' and 'ask' Order objects
+        """
+        symbol = self._normalize_symbol(symbol)
+        
+        if cancel_existing:
+            self.cancel_all(symbol)
+        
+        bid_order = self.limit_buy(symbol, price=bid_price, size=size, post_only=True)
+        ask_order = self.limit_sell(symbol, price=ask_price, size=size, post_only=True)
+        
+        return {
+            "bid": bid_order,
+            "ask": ask_order,
+        }
+    
     # ==================== Convenience ====================
     
     def summary(self) -> Dict[str, Any]:

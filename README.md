@@ -1,8 +1,22 @@
-# Agent Trading SDK
+# Arthur SDK
 
-**Simple trading for AI agents on Orderly Network.**
+**The easiest way for AI agents to trade crypto perpetuals.**
 
-No complex signatures. No confusing structs. Just trade.
+3 lines of Python. No complex signatures. No confusing structs. Just trade.
+
+```python
+from orderly_agent import Arthur
+client = Arthur.from_credentials_file("credentials.json")
+client.buy("ETH", usd=100)  # Done.
+```
+
+## Why Arthur?
+
+- 🚀 **Dead simple** - Trade in 3 lines of code
+- 🤖 **Built for agents** - Clean API, no boilerplate
+- ⚡ **Fast execution** - Powered by Orderly Network
+- 📊 **50+ markets** - BTC, ETH, SOL, ARB, and more
+- 🔒 **Non-custodial** - Your keys, your coins
 
 ## Installation
 
@@ -15,21 +29,14 @@ pip install agent-trading-sdk
 ```python
 from orderly_agent import Arthur
 
-# Initialize with credentials
-client = Arthur(
-    api_key="ed25519:xxx",
-    secret_key="ed25519:xxx",
-    account_id="0x..."
-)
-
-# Or load from file
+# Load credentials
 client = Arthur.from_credentials_file("credentials.json")
 
 # Trade
-client.buy("ETH", usd=100)      # Buy $100 worth of ETH
-client.sell("BTC", size=0.01)   # Sell 0.01 BTC
-client.close("ETH")             # Close ETH position
-client.close_all()              # Close all positions
+client.buy("ETH", usd=100)      # Long $100 of ETH
+client.sell("BTC", size=0.01)   # Short 0.01 BTC
+client.close("ETH")             # Close position
+client.close_all()              # Close everything
 
 # Check status
 print(client.balance())         # Available USDC
@@ -37,12 +44,57 @@ print(client.pnl())             # Total unrealized PnL
 print(client.positions())       # All open positions
 ```
 
-## Features
+## Strategy Examples
 
-### Simple Trading
+### RSI Strategy
+```python
+# Buy oversold, sell overbought
+if rsi < 30:
+    client.buy("ETH", usd=100)
+elif rsi > 70:
+    client.sell("ETH", usd=100)
+```
+👉 [Full RSI example](examples/rsi_strategy.py)
+
+### Momentum Strategy
+```python
+# Trend following with trailing stops
+if price > recent_high:
+    client.buy("BTC", usd=200)
+```
+👉 [Full momentum example](examples/momentum_strategy.py)
+
+### Grid Trading
+```python
+# Profit from sideways markets
+for level in grid_levels:
+    client.buy(symbol, price=level, usd=50)
+```
+👉 [Full grid example](examples/grid_trading.py)
+
+### AI Agent
+```python
+# Let your LLM make decisions
+context = get_market_context(client, ["BTC", "ETH"])
+decision = llm.chat(TRADING_PROMPT, context)
+execute_trade(client, decision)
+```
+👉 [Full AI agent example](examples/ai_agent.py)
+
+### Portfolio Rebalancer
+```python
+# Maintain target allocations
+targets = {"BTC": 50, "ETH": 30, "SOL": 20}
+rebalance_portfolio(client, targets)
+```
+👉 [Full rebalancer example](examples/portfolio_rebalance.py)
+
+## API Reference
+
+### Trading
 
 ```python
-# Market orders (instant execution)
+# Market orders
 client.buy("ETH", usd=100)      # Buy by USD value
 client.buy("BTC", size=0.01)    # Buy by size
 
@@ -50,7 +102,7 @@ client.buy("BTC", size=0.01)    # Buy by size
 client.buy("ETH", size=0.1, price=2000)
 
 # Close positions
-client.close("ETH")             # Close specific position
+client.close("ETH")             # Close all of symbol
 client.close("ETH", size=0.05)  # Partial close
 client.close_all()              # Close everything
 ```
@@ -71,17 +123,6 @@ eth_pos = client.position("ETH")
 total_pnl = client.pnl()
 ```
 
-### Risk Management
-
-```python
-# Set leverage
-client.set_leverage("ETH", 10)
-
-# Set stop loss
-client.set_stop_loss("ETH", price=1900)       # By price
-client.set_stop_loss("ETH", pct=5)            # By percentage
-```
-
 ### Market Data
 
 ```python
@@ -90,42 +131,27 @@ btc_price = client.price("BTC")
 
 # Get all prices
 prices = client.prices()
-print(prices["ETH"])  # or prices["PERP_ETH_USDC"]
 ```
 
 ### Account Info
 
 ```python
-# Balance and equity
 balance = client.balance()    # Available USDC
 equity = client.equity()      # Total value
-
-# Full summary
-summary = client.summary()
-print(summary)
-# {
-#     "balance": 1000.00,
-#     "equity": 1050.00,
-#     "positions": 2,
-#     "unrealized_pnl": 50.00,
-#     "position_details": [...]
-# }
+summary = client.summary()    # Full details
 ```
 
-### Order Management
+### Risk Management
 
 ```python
-# Get open orders
-orders = client.orders()
-orders = client.orders("ETH")  # Filter by symbol
-
-# Cancel orders
-client.cancel(order_id="123", symbol="ETH")
-client.cancel_all()            # Cancel all
-client.cancel_all("ETH")       # Cancel all for symbol
+client.set_leverage("ETH", 10)
+client.set_stop_loss("ETH", price=1900)
+client.set_stop_loss("ETH", pct=5)  # 5% stop
 ```
 
-## Credentials File Format
+## Credentials
+
+Create a `credentials.json`:
 
 ```json
 {
@@ -135,42 +161,25 @@ client.cancel_all("ETH")       # Cancel all for symbol
 }
 ```
 
-Or Orderly-native format:
+Get credentials from [Arthur DEX](https://arthurdex.com) or any Orderly-powered DEX.
 
-```json
-{
-    "orderly_key": "ed25519:xxx",
-    "orderly_secret": "ed25519:xxx",
-    "account_id": "0x..."
-}
-```
+## Supported Markets
 
-## Supported Symbols
-
-Short symbols are automatically converted:
+Short symbols work automatically:
 
 | Short | Full Symbol |
 |-------|-------------|
 | BTC | PERP_BTC_USDC |
 | ETH | PERP_ETH_USDC |
 | SOL | PERP_SOL_USDC |
-| ARB | PERP_ARB_USDC |
-| OP | PERP_OP_USDC |
-| AVAX | PERP_AVAX_USDC |
-| LINK | PERP_LINK_USDC |
-| WOO | PERP_WOO_USDC |
-| ORDER | PERP_ORDER_USDC |
-| ... | ... |
+| ARB, OP, AVAX, LINK... | PERP_*_USDC |
+
+50+ perpetual markets available.
 
 ## Testnet
 
 ```python
-client = Arthur(
-    api_key="...",
-    secret_key="...",
-    account_id="...",
-    testnet=True  # Use testnet
-)
+client = Arthur(..., testnet=True)
 ```
 
 ## Error Handling
@@ -186,20 +195,16 @@ except OrderError as e:
     print(f"Order failed: {e}")
 ```
 
-## Coming Soon
-
-- [ ] Strategy templates (DCA, grid, momentum)
-- [ ] Backtesting
-- [ ] Paper trading mode
-- [ ] WebSocket for real-time updates
-- [ ] Natural language orders
-
 ## Links
 
-- **Dashboard:** https://arthur-dex.vercel.app
-- **Orderly Network:** https://orderly.network
-- **Docs:** Coming soon
+- **Trade:** [arthurdex.com](https://arthurdex.com)
+- **Twitter:** [@Arthur_Orderly](https://twitter.com/Arthur_Orderly)
+- **Orderly Network:** [orderly.network](https://orderly.network)
+
+## License
+
+MIT
 
 ---
 
-Built by Arthur 🦊 for agents, on Orderly Network.
+Built by Arthur 🤖 for AI agents, powered by Orderly Network.
