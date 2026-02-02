@@ -141,6 +141,32 @@ equity = client.equity()      # Total value
 summary = client.summary()    # Full details
 ```
 
+### Withdrawals
+
+```python
+# Initialize with wallet for withdrawals
+client = Arthur(
+    api_key="...",
+    secret_key="...",
+    account_id="...",
+    wallet_private_key="...",  # Required for withdrawals!
+    chain_id=42161,  # Arbitrum One
+)
+
+# Withdraw 100 USDC to your wallet
+result = client.withdraw(100)
+print(f"Withdrawal ID: {result['withdraw_id']}")
+
+# Withdraw to a different chain
+client.withdraw(50, to_chain_id=10)  # Optimism
+
+# Check withdrawal history
+for w in client.withdrawal_history():
+    print(f"{w['id']}: {w['amount']} USDC - {w['status']}")
+```
+
+👉 [Full withdrawal example](examples/withdrawal.py)
+
 ### Risk Management
 
 ```python

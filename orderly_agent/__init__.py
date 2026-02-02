@@ -15,7 +15,7 @@ Usage:
 
 from .client import Arthur, Position, Order
 from .strategies import StrategyRunner, StrategyConfig, Signal, run_strategy
-from .exceptions import ArthurError, AuthError, OrderError, InsufficientFundsError
+from .exceptions import ArthurError, AuthError, OrderError, InsufficientFundsError, WithdrawalError
 
 __version__ = "0.1.0"
 __all__ = [
@@ -33,4 +33,5 @@ __all__ = [
     "AuthError",
     "OrderError",
     "InsufficientFundsError",
+    "WithdrawalError",
 ]

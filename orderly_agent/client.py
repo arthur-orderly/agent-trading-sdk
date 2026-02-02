@@ -12,7 +12,7 @@ from dataclasses import dataclass
 import urllib.request
 import urllib.error
 
-from .exceptions import ArthurError, AuthError, OrderError, InsufficientFundsError
+from .exceptions import ArthurError, AuthError, OrderError, InsufficientFundsError, WithdrawalError
 from .auth import generate_auth_headers
 
 
@@ -76,11 +76,16 @@ class Arthur:
         "ORDER": "PERP_ORDER_USDC",
     }
     
+    # EIP-712 constants for withdrawals
+    VERIFYING_CONTRACT = "0x6F7a338F2aA472838dEFD3283eB360d4Dff5D203"
+    
     def __init__(
         self,
         api_key: Optional[str] = None,
         secret_key: Optional[str] = None,
         account_id: Optional[str] = None,
+        wallet_private_key: Optional[str] = None,
+        chain_id: int = 42161,  # Default to Arbitrum One
         testnet: bool = False,
     ):
         """
@@ -90,25 +95,38 @@ class Arthur:
             api_key: Orderly API key (ed25519:xxx format)
             secret_key: Orderly secret key (ed25519:xxx format)
             account_id: Orderly account ID
+            wallet_private_key: Ethereum wallet private key (for withdrawals)
+            chain_id: EVM chain ID (default: 42161 for Arbitrum One)
             testnet: Use testnet instead of mainnet
         """
         self.api_key = api_key
         self.secret_key = secret_key
         self.account_id = account_id
+        self.wallet_private_key = wallet_private_key
+        self.chain_id = chain_id
         
         if testnet:
             self.BASE_URL = "https://testnet-api-evm.orderly.org"
             
         self._prices_cache = {}
         self._prices_cache_time = 0
+        self._wallet_account = None
         
     @classmethod
-    def from_credentials_file(cls, path: str, testnet: bool = False) -> "Arthur":
+    def from_credentials_file(
+        cls, 
+        path: str, 
+        wallet_file: Optional[str] = None,
+        chain_id: int = 42161,
+        testnet: bool = False
+    ) -> "Arthur":
         """
         Load credentials from a JSON file.
         
         Args:
             path: Path to credentials JSON file
+            wallet_file: Path to wallet JSON file (for withdrawals)
+            chain_id: EVM chain ID (default: 42161 for Arbitrum One)
             testnet: Use testnet
             
         Returns:
@@ -117,10 +135,18 @@ class Arthur:
         with open(path) as f:
             creds = json.load(f)
         
+        wallet_pk = None
+        if wallet_file:
+            with open(wallet_file) as f:
+                wallet_data = json.load(f)
+                wallet_pk = wallet_data.get("privateKey") or wallet_data.get("private_key")
+        
         return cls(
             api_key=creds.get("orderly_key") or creds.get("api_key") or creds.get("key"),
             secret_key=creds.get("orderly_secret") or creds.get("secret_key"),
             account_id=creds.get("account_id"),
+            wallet_private_key=wallet_pk,
+            chain_id=chain_id,
             testnet=testnet,
         )
     
@@ -252,6 +278,202 @@ class Arthur:
         if resp.get("success"):
             return float(resp["data"].get("total_equity", 0))
         return 0.0
+    
+    # ==================== Withdrawals ====================
+    
+    def _get_wallet_account(self):
+        """Get or create eth_account Account for wallet operations"""
+        if self._wallet_account is None:
+            if not self.wallet_private_key:
+                raise WithdrawalError("wallet_private_key required for withdrawals")
+            try:
+                from eth_account import Account
+                self._wallet_account = Account.from_key(self.wallet_private_key)
+            except ImportError:
+                raise WithdrawalError("eth-account package required: pip install eth-account")
+        return self._wallet_account
+    
+    def _sign_withdrawal(
+        self,
+        receiver: str,
+        token: str,
+        amount: int,
+        withdraw_nonce: int,
+        timestamp: int,
+    ) -> str:
+        """Sign a withdrawal request with EIP-712"""
+        try:
+            from eth_account.messages import encode_typed_data
+        except ImportError:
+            raise WithdrawalError("eth-account package required: pip install eth-account")
+        
+        account = self._get_wallet_account()
+        
+        full_typed_data = {
+            "types": {
+                "EIP712Domain": [
+                    {"name": "name", "type": "string"},
+                    {"name": "version", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "verifyingContract", "type": "address"},
+                ],
+                "Withdraw": [
+                    {"name": "brokerId", "type": "string"},
+                    {"name": "chainId", "type": "uint256"},
+                    {"name": "receiver", "type": "address"},
+                    {"name": "token", "type": "string"},
+                    {"name": "amount", "type": "uint256"},
+                    {"name": "withdrawNonce", "type": "uint64"},
+                    {"name": "timestamp", "type": "uint64"},
+                ]
+            },
+            "primaryType": "Withdraw",
+            "domain": {
+                "name": "Orderly",
+                "version": "1",
+                "chainId": self.chain_id,
+                "verifyingContract": self.VERIFYING_CONTRACT
+            },
+            "message": {
+                "brokerId": self.BROKER_ID,
+                "chainId": self.chain_id,
+                "receiver": receiver,
+                "token": token,
+                "amount": amount,
+                "withdrawNonce": withdraw_nonce,
+                "timestamp": timestamp,
+            }
+        }
+        
+        signable = encode_typed_data(full_message=full_typed_data)
+        signed = account.sign_message(signable)
+        return '0x' + signed.signature.hex()
+    
+    def withdraw(
+        self,
+        amount: float,
+        token: str = "USDC",
+        to_chain_id: Optional[int] = None,
+        receiver: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Withdraw funds from Orderly to your wallet.
+        
+        Args:
+            amount: Amount to withdraw
+            token: Token to withdraw (default: USDC)
+            to_chain_id: Destination chain ID (default: client's chain_id)
+            receiver: Receiving address (default: wallet address)
+            
+        Returns:
+            Dict with withdraw_id and status
+            
+        Example:
+            client.withdraw(100)  # Withdraw 100 USDC to Arbitrum One
+            client.withdraw(50, to_chain_id=10)  # Withdraw to Optimism
+        """
+        account = self._get_wallet_account()
+        
+        chain_id = to_chain_id or self.chain_id
+        receiver = receiver or account.address
+        
+        # Get withdrawal nonce
+        nonce_resp = self._request("GET", "/v1/withdraw_nonce")
+        if not nonce_resp.get("success"):
+            raise WithdrawalError(f"Failed to get withdrawal nonce: {nonce_resp.get('message')}")
+        withdraw_nonce = nonce_resp["data"]["withdraw_nonce"]
+        
+        # Convert amount to integer (USDC has 6 decimals)
+        decimals = 6 if token == "USDC" else 18
+        amount_int = int(amount * (10 ** decimals))
+        
+        timestamp = int(time.time() * 1000)
+        
+        # Sign the withdrawal
+        signature = self._sign_withdrawal(
+            receiver=receiver,
+            token=token,
+            amount=amount_int,
+            withdraw_nonce=withdraw_nonce,
+            timestamp=timestamp,
+        )
+        
+        # Submit withdrawal request
+        withdraw_body = {
+            "signature": signature,
+            "userAddress": account.address,
+            "verifyingContract": self.VERIFYING_CONTRACT,
+            "message": {
+                "brokerId": self.BROKER_ID,
+                "chainId": chain_id,
+                "receiver": receiver,
+                "token": token,
+                "amount": str(amount_int),
+                "withdrawNonce": str(withdraw_nonce),
+                "timestamp": str(timestamp),
+                "chainType": "EVM",
+                "allowCrossChainWithdraw": True,  # Enable cross-chain
+            }
+        }
+        
+        resp = self._request("POST", "/v1/withdraw_request", data=withdraw_body)
+        
+        if not resp.get("success"):
+            raise WithdrawalError(f"Withdrawal failed: {resp.get('message')}")
+        
+        return {
+            "withdraw_id": resp["data"]["withdraw_id"],
+            "amount": amount,
+            "token": token,
+            "chain_id": chain_id,
+            "receiver": receiver,
+            "status": "PENDING",
+        }
+    
+    def withdrawal_history(self, limit: int = 10) -> List[Dict]:
+        """
+        Get withdrawal history.
+        
+        Args:
+            limit: Number of records to return
+            
+        Returns:
+            List of withdrawal records
+        """
+        resp = self._request("GET", f"/v1/asset/history?side=WITHDRAW&limit={limit}")
+        
+        if not resp.get("success"):
+            return []
+        
+        withdrawals = []
+        for row in resp["data"].get("rows", []):
+            withdrawals.append({
+                "id": row["id"],
+                "amount": float(row["amount"]),
+                "token": row["token"],
+                "fee": float(row.get("fee", 0)),
+                "status": row["trans_status"],
+                "chain_id": row.get("chain_id"),
+                "tx_id": row.get("tx_id"),
+                "created_at": row.get("created_time"),
+            })
+        return withdrawals
+    
+    def withdrawal_status(self, withdraw_id: str) -> Optional[Dict]:
+        """
+        Check status of a specific withdrawal.
+        
+        Args:
+            withdraw_id: Withdrawal ID from withdraw() response
+            
+        Returns:
+            Withdrawal details or None if not found
+        """
+        history = self.withdrawal_history(limit=50)
+        for w in history:
+            if str(w["id"]) == str(withdraw_id):
+                return w
+        return None
     
     # ==================== Positions ====================
     

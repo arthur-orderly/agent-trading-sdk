@@ -29,3 +29,8 @@ class PositionError(ArthurError):
 class RateLimitError(ArthurError):
     """Rate limit exceeded"""
     pass
+
+
+class WithdrawalError(ArthurError):
+    """Withdrawal operation failed"""
+    pass
