@@ -1,0 +1,1063 @@
+"""
+Arthur SDK Client - Main trading interface for AI agents.
+
+Trade in 3 lines:
+    from arthur_sdk import Arthur
+    client = Arthur.from_credentials_file("creds.json")
+    client.buy("ETH", usd=100)
+
+Built for Arthur DEX: https://arthurdex.com
+"""
+
+import json
+import logging
+import ssl
+import time
+import hmac
+import hashlib
+import base64
+from typing import Optional, Dict, List, Any, Union
+from dataclasses import dataclass
+import urllib.request
+import urllib.error
+
+from .exceptions import ArthurError, AuthError, OrderError, InsufficientFundsError
+from .auth import generate_auth_headers
+
+logger = logging.getLogger("arthur_sdk")
+
+
+@dataclass
+class Position:
+    """Represents an open position"""
+    symbol: str
+    side: str  # "LONG" or "SHORT"
+    size: float
+    entry_price: float
+    mark_price: float
+    unrealized_pnl: float
+    leverage: float
+    
+    @property
+    def pnl_percent(self) -> float:
+        if self.entry_price == 0:
+            return 0
+        return (self.unrealized_pnl / (self.size * self.entry_price)) * 100
+
+
+@dataclass 
+class Order:
+    """Represents an order"""
+    order_id: str
+    symbol: str
+    side: str
+    order_type: str
+    price: Optional[float]
+    size: float
+    status: str
+    created_at: int
+
+
+class Arthur:
+    """
+    Arthur SDK Client - Simple trading for AI agents.
+    
+    Built for Arthur DEX (https://arthurdex.com) on Orderly Network.
+    
+    Example:
+        from arthur_sdk import Arthur
+        
+        client = Arthur(api_key="your_key", secret_key="your_secret")
+        client.buy("ETH", usd=100)
+        client.positions()
+    """
+    
+    BASE_URL = "https://api-evm.orderly.org"
+    BROKER_ID = "arthur_dex"
+    MAX_ORDER_USD = 100_000  # Sanity check: max single order size in USD
+    
+    # Symbol mappings for convenience
+    SYMBOL_MAP = {
+        "BTC": "PERP_BTC_USDC",
+        "ETH": "PERP_ETH_USDC", 
+        "SOL": "PERP_SOL_USDC",
+        "ARB": "PERP_ARB_USDC",
+        "OP": "PERP_OP_USDC",
+        "AVAX": "PERP_AVAX_USDC",
+        "LINK": "PERP_LINK_USDC",
+        "DOGE": "PERP_DOGE_USDC",
+        "SUI": "PERP_SUI_USDC",
+        "TIA": "PERP_TIA_USDC",
+        "WOO": "PERP_WOO_USDC",
+        "ORDER": "PERP_ORDER_USDC",
+    }
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        secret_key: Optional[str] = None,
+        account_id: Optional[str] = None,
+        testnet: bool = False,
+    ):
+        """
+        Initialize Arthur client.
+        
+        Args:
+            api_key: Orderly API key (ed25519:xxx format)
+            secret_key: Orderly secret key (ed25519:xxx format)
+            account_id: Orderly account ID
+            testnet: Use testnet instead of mainnet
+        """
+        self.api_key = api_key
+        self.secret_key = secret_key
+        self.account_id = account_id
+        
+        if testnet:
+            self.BASE_URL = "https://testnet-api-evm.orderly.org"
+            
+        self._prices_cache = {}
+        self._prices_cache_time = 0
+        
+        # Rate limiting
+        self._last_request_time = 0
+        self._min_request_interval = 0.05  # 50ms between requests
+        
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass  # Future: cleanup resources (cancel orders, close connections)
+
+    @classmethod
+    def from_credentials_file(cls, path: str, testnet: bool = False) -> "Arthur":
+        """
+        Load credentials from a JSON file.
+        
+        Args:
+            path: Path to credentials JSON file
+            testnet: Use testnet
+            
+        Returns:
+            Configured Arthur client
+            
+        Raises:
+            AuthError: If credentials are missing or malformed
+        """
+        with open(path) as f:
+            creds = json.load(f)
+        
+        api_key = creds.get("orderly_key") or creds.get("api_key") or creds.get("key")
+        secret_key = creds.get("orderly_secret") or creds.get("secret_key")
+        account_id = creds.get("account_id")
+        
+        # Warn about missing keys
+        expected_keys = {"orderly_key", "orderly_secret", "account_id"}
+        found_keys = set(creds.keys())
+        missing = expected_keys - found_keys
+        if missing:
+            logger.warning(f"Credentials file missing expected keys: {missing}. "
+                          f"Found keys: {found_keys}")
+        
+        # Validate credential formats
+        if api_key and not api_key.startswith("ed25519:"):
+            raise AuthError(
+                f"Invalid api_key format: must start with 'ed25519:', got '{api_key[:20]}...'"
+            )
+        if secret_key and not secret_key.startswith("ed25519:"):
+            raise AuthError(
+                f"Invalid secret_key format: must start with 'ed25519:'"
+            )
+        if account_id and not account_id.startswith("0x"):
+            raise AuthError(
+                f"Invalid account_id format: must start with '0x', got '{account_id[:20]}...'"
+            )
+        
+        if not api_key or not secret_key or not account_id:
+            raise AuthError(
+                "Credentials file must contain api_key, secret_key, and account_id. "
+                "See https://arthurdex.com/docs for setup instructions."
+            )
+        
+        return cls(
+            api_key=api_key,
+            secret_key=secret_key,
+            account_id=account_id,
+            testnet=testnet,
+        )
+    
+    def _normalize_symbol(self, symbol: str) -> str:
+        """Convert short symbol (ETH) to full symbol (PERP_ETH_USDC)"""
+        symbol = symbol.upper()
+        if symbol in self.SYMBOL_MAP:
+            return self.SYMBOL_MAP[symbol]
+        if symbol.startswith("PERP_"):
+            return symbol
+        return f"PERP_{symbol}_USDC"
+    
+    def _sign_request(self, method: str, path: str, body: str = "") -> Dict[str, str]:
+        """Generate signed headers for authenticated request"""
+        if not self.api_key or not self.secret_key or not self.account_id:
+            raise AuthError("Missing credentials: api_key, secret_key, and account_id required")
+        
+        return generate_auth_headers(
+            api_key=self.api_key,
+            secret_key=self.secret_key,
+            account_id=self.account_id,
+            method=method,
+            path=path,
+            body=body,
+        )
+    
+    def _request(
+        self, 
+        method: str, 
+        path: str, 
+        data: Optional[Dict] = None,
+        auth: bool = True
+    ) -> Dict:
+        """Make HTTP request to Orderly API"""
+        # Rate limiting: enforce minimum interval between requests
+        now = time.time()
+        elapsed = now - self._last_request_time
+        if elapsed < self._min_request_interval:
+            time.sleep(self._min_request_interval - elapsed)
+        self._last_request_time = time.time()
+        
+        url = f"{self.BASE_URL}{path}"
+        body = json.dumps(data) if data else ""
+        
+        headers = {}
+        if auth:
+            headers = self._sign_request(method, path, body)
+        else:
+            headers = {"Content-Type": "application/json"}
+        
+        # DELETE requests without body need different content-type
+        if method == "DELETE" and not data:
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        
+        req = urllib.request.Request(
+            url,
+            data=body.encode() if body else None,
+            headers=headers,
+            method=method
+        )
+        
+        # Use proper SSL context for certificate verification
+        ssl_context = ssl.create_default_context()
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30, context=ssl_context) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode()
+            try:
+                error_data = json.loads(error_body)
+                raise ArthurError(f"API Error: {error_data.get('message', error_body)}")
+            except json.JSONDecodeError:
+                raise ArthurError(f"API Error ({e.code}): {error_body}")
+    
+    # ==================== Market Data ====================
+    
+    def price(self, symbol: str) -> float:
+        """
+        Get current price for a symbol.
+        
+        Note: Uses 5-second cache. For real-time prices in high-frequency
+        strategies, use the orderbook() method instead.
+        
+        Args:
+            symbol: Token symbol (e.g., "ETH" or "PERP_ETH_USDC")
+            
+        Returns:
+            Current mark price
+        """
+        symbol = self._normalize_symbol(symbol)
+        
+        # Check cache (5 second TTL)
+        now = time.time()
+        if now - self._prices_cache_time < 5 and symbol in self._prices_cache:
+            return self._prices_cache[symbol]
+        
+        resp = self._request("GET", f"/v1/public/futures/{symbol}", auth=False)
+        if resp.get("success"):
+            price = float(resp["data"]["mark_price"])
+            self._prices_cache[symbol] = price
+            self._prices_cache_time = now
+            return price
+        raise ArthurError(f"Failed to get price for {symbol}")
+    
+    def prices(self) -> Dict[str, float]:
+        """Get prices for all supported symbols"""
+        resp = self._request("GET", "/v1/public/futures", auth=False)
+        if resp.get("success"):
+            prices = {}
+            for item in resp["data"]["rows"]:
+                symbol = item["symbol"]
+                prices[symbol] = float(item["mark_price"])
+                # Also add short name
+                short = symbol.replace("PERP_", "").replace("_USDC", "")
+                prices[short] = float(item["mark_price"])
+            self._prices_cache = prices
+            self._prices_cache_time = time.time()
+            return prices
+        raise ArthurError("Failed to get prices")
+    
+    # ==================== Account ====================
+    
+    def balance(self) -> float:
+        """
+        Get available USDC balance.
+        
+        Returns:
+            Available balance in USDC
+        """
+        resp = self._request("GET", "/v1/client/holding")
+        if resp.get("success"):
+            for holding in resp["data"]["holding"]:
+                if holding["token"] == "USDC":
+                    return float(holding["holding"])
+        return 0.0
+    
+    def equity(self) -> float:
+        """
+        Get total account equity (balance + unrealized PnL).
+        
+        Returns:
+            Total equity in USDC
+        """
+        resp = self._request("GET", "/v1/client/holding")
+        if resp.get("success"):
+            return float(resp["data"].get("total_equity", 0))
+        return 0.0
+    
+    # ==================== Positions ====================
+    
+    def positions(self) -> List[Position]:
+        """
+        Get all open positions.
+        
+        Returns:
+            List of Position objects
+        """
+        resp = self._request("GET", "/v1/positions")
+        if not resp.get("success"):
+            return []
+        
+        positions = []
+        for row in resp["data"].get("rows", []):
+            if float(row.get("position_qty", 0)) != 0:
+                positions.append(Position(
+                    symbol=row["symbol"],
+                    side="LONG" if float(row["position_qty"]) > 0 else "SHORT",
+                    size=abs(float(row["position_qty"])),
+                    entry_price=float(row.get("average_open_price", 0)),
+                    mark_price=float(row.get("mark_price", 0)),
+                    unrealized_pnl=float(row.get("unrealized_pnl", 0)),
+                    leverage=float(row.get("leverage", 1)),
+                ))
+        return positions
+    
+    def position(self, symbol: str) -> Optional[Position]:
+        """
+        Get position for a specific symbol.
+        
+        Args:
+            symbol: Token symbol
+            
+        Returns:
+            Position object or None if no position
+        """
+        symbol = self._normalize_symbol(symbol)
+        for pos in self.positions():
+            if pos.symbol == symbol:
+                return pos
+        return None
+    
+    def pnl(self) -> float:
+        """
+        Get total unrealized PnL across all positions.
+        
+        Returns:
+            Total unrealized PnL in USDC
+        """
+        return sum(pos.unrealized_pnl for pos in self.positions())
+    
+    # ==================== Trading ====================
+    
+    def buy(
+        self,
+        symbol: str,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        price: Optional[float] = None,
+        reduce_only: bool = False,
+    ) -> Order:
+        """
+        Open or add to a long position.
+        
+        Args:
+            symbol: Token symbol (e.g., "ETH")
+            size: Position size in base asset (e.g., 0.1 ETH)
+            usd: Position size in USD (alternative to size)
+            price: Limit price (None for market order)
+            reduce_only: Only reduce existing position
+            
+        Returns:
+            Order object
+            
+        Example:
+            client.buy("ETH", usd=100)  # Buy $100 worth of ETH
+            client.buy("BTC", size=0.01)  # Buy 0.01 BTC
+        """
+        return self._place_order(
+            symbol=symbol,
+            side="BUY",
+            size=size,
+            usd=usd,
+            price=price,
+            reduce_only=reduce_only,
+        )
+    
+    def sell(
+        self,
+        symbol: str,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        price: Optional[float] = None,
+        reduce_only: bool = False,
+    ) -> Order:
+        """
+        Open or add to a short position.
+        
+        Args:
+            symbol: Token symbol
+            size: Position size in base asset
+            usd: Position size in USD
+            price: Limit price (None for market order)
+            reduce_only: Only reduce existing position
+            
+        Returns:
+            Order object
+        """
+        return self._place_order(
+            symbol=symbol,
+            side="SELL",
+            size=size,
+            usd=usd,
+            price=price,
+            reduce_only=reduce_only,
+        )
+    
+    def close(self, symbol: str, size: Optional[float] = None) -> Optional[Order]:
+        """
+        Close a position (partially or fully).
+        
+        Args:
+            symbol: Token symbol
+            size: Size to close (None = close entire position)
+            
+        Returns:
+            Order object, or None if no position to close
+        """
+        pos = self.position(symbol)
+        if not pos:
+            return None
+        
+        close_size = size or pos.size
+        close_side = "SELL" if pos.side == "LONG" else "BUY"
+        
+        return self._place_order(
+            symbol=symbol,
+            side=close_side,
+            size=close_size,
+            reduce_only=True,
+        )
+    
+    def close_all(self) -> List[Order]:
+        """
+        Close all open positions.
+        
+        Returns:
+            List of Order objects for each closed position
+        """
+        orders = []
+        for pos in self.positions():
+            order = self.close(pos.symbol)
+            if order:
+                orders.append(order)
+        return orders
+    
+    def _place_order(
+        self,
+        symbol: str,
+        side: str,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        price: Optional[float] = None,
+        reduce_only: bool = False,
+    ) -> Order:
+        """Internal method to place an order"""
+        symbol = self._normalize_symbol(symbol)
+        
+        # Validate USD amount
+        if usd is not None:
+            if usd <= 0:
+                raise OrderError(f"USD amount must be positive, got {usd}")
+            if usd > self.MAX_ORDER_USD:
+                raise OrderError(
+                    f"USD amount {usd} exceeds MAX_ORDER_USD ({self.MAX_ORDER_USD}). "
+                    f"Increase Arthur.MAX_ORDER_USD if this is intentional."
+                )
+        
+        # Calculate size from USD if needed
+        if usd and not size:
+            current_price = self.price(symbol)
+            size = usd / current_price
+        
+        if not size:
+            raise OrderError("Must specify either size or usd")
+        
+        # Validate size
+        if size <= 0:
+            raise OrderError(f"Order size must be positive, got {size}")
+        
+        order_type = "LIMIT" if price else "MARKET"
+        
+        order_data = {
+            "symbol": symbol,
+            "side": side,
+            "order_type": order_type,
+            "order_quantity": str(size),
+            "reduce_only": reduce_only,
+        }
+        
+        if price:
+            order_data["order_price"] = str(price)
+        
+        resp = self._request("POST", "/v1/order", data=order_data)
+        
+        if not resp.get("success"):
+            error = resp.get("message", "Unknown error")
+            if "insufficient" in error.lower():
+                raise InsufficientFundsError(error)
+            raise OrderError(error)
+        
+        data = resp["data"]
+        return Order(
+            order_id=str(data["order_id"]),
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            price=price,
+            size=size,
+            status=data.get("status", "NEW"),
+            created_at=int(time.time() * 1000),
+        )
+    
+    # ==================== Risk Management ====================
+    
+    def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """
+        Set leverage for a symbol.
+        
+        Args:
+            symbol: Token symbol
+            leverage: Leverage multiplier (1-50)
+            
+        Returns:
+            True if successful
+        """
+        symbol = self._normalize_symbol(symbol)
+        resp = self._request(
+            "POST",
+            "/v1/client/leverage",
+            data={"symbol": symbol, "leverage": leverage}
+        )
+        return resp.get("success", False)
+    
+    def limit_close(
+        self,
+        symbol: str,
+        price: Optional[float] = None,
+        pct: Optional[float] = None,
+    ) -> Order:
+        """
+        Place a limit order to close a position at a specific price.
+        
+        WARNING: This places a regular limit order, NOT a stop order. The order
+        will execute immediately if the limit price is marketable. For example,
+        if you have a BTC long at $95k and call limit_close(price=60000), it
+        will sell at market (~$95k), not wait for price to drop to $60k.
+        
+        For actual stop-loss behavior (trigger when price reaches level),
+        use set_stop_loss() instead.
+        
+        Args:
+            symbol: Token symbol
+            price: Limit price to close at
+            pct: Percentage from entry price (alternative to price)
+            
+        Returns:
+            Order object for the limit close order
+        """
+        pos = self.position(symbol)
+        if not pos:
+            raise OrderError(f"No position for {symbol}")
+        
+        if pct and not price:
+            if pos.side == "LONG":
+                price = pos.entry_price * (1 - pct / 100)
+            else:
+                price = pos.entry_price * (1 + pct / 100)
+        
+        if not price:
+            raise OrderError("Must specify price or pct")
+        
+        side = "SELL" if pos.side == "LONG" else "BUY"
+        return self._place_order(
+            symbol=symbol,
+            side=side,
+            size=pos.size,
+            price=price,
+            reduce_only=True,
+        )
+    
+    def set_stop_loss(
+        self,
+        symbol: str,
+        trigger_price: Optional[float] = None,
+        pct: Optional[float] = None,
+        limit_price: Optional[float] = None,
+    ) -> Dict:
+        """
+        Set a stop-loss order using Orderly's algo order endpoint.
+        
+        This creates a STOP_MARKET or STOP_LIMIT order that triggers when the
+        mark price reaches the trigger_price. Unlike limit_close(), this will
+        NOT execute immediately — it waits for the trigger condition.
+        
+        Args:
+            symbol: Token symbol
+            trigger_price: Price at which the stop triggers
+            pct: Stop loss percentage from entry (alternative to trigger_price)
+            limit_price: If set, uses STOP_LIMIT instead of STOP_MARKET.
+                        The limit price for the order after trigger.
+            
+        Returns:
+            Dict with algo order response data
+            
+        Raises:
+            OrderError: If no position exists or parameters are invalid
+            
+        Example:
+            # Stop market: sells at market when BTC drops to $90k
+            client.set_stop_loss("BTC", trigger_price=90000)
+            
+            # Stop limit: places limit sell at $89.5k when BTC drops to $90k
+            client.set_stop_loss("BTC", trigger_price=90000, limit_price=89500)
+            
+            # By percentage: stop 5% below entry
+            client.set_stop_loss("BTC", pct=5)
+        """
+        pos = self.position(symbol)
+        if not pos:
+            raise OrderError(f"No position for {symbol}")
+        
+        symbol = self._normalize_symbol(symbol)
+        
+        if pct and not trigger_price:
+            if pos.side == "LONG":
+                trigger_price = pos.entry_price * (1 - pct / 100)
+            else:
+                trigger_price = pos.entry_price * (1 + pct / 100)
+        
+        if not trigger_price:
+            raise OrderError("Must specify trigger_price or pct")
+        
+        side = "SELL" if pos.side == "LONG" else "BUY"
+        algo_type = "STOP_LIMIT" if limit_price else "STOP_MARKET"
+        
+        order_data = {
+            "symbol": symbol,
+            "side": side,
+            "order_quantity": str(pos.size),
+            "trigger_price": str(trigger_price),
+            "type": algo_type,
+            "reduce_only": True,
+        }
+        
+        if limit_price:
+            order_data["order_price"] = str(limit_price)
+        
+        logger.info(
+            f"Setting {algo_type} stop loss for {symbol}: "
+            f"trigger={trigger_price}, side={side}, size={pos.size}"
+        )
+        
+        resp = self._request("POST", "/v1/algo/order", data=order_data)
+        
+        if not resp.get("success"):
+            error = resp.get("message", "Unknown error")
+            raise OrderError(f"Failed to set stop loss: {error}")
+        
+        return resp["data"]
+    
+    # ==================== Info ====================
+    
+    def orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """
+        Get open orders.
+        
+        Args:
+            symbol: Filter by symbol (optional)
+            
+        Returns:
+            List of Order objects
+        """
+        path = "/v1/orders?status=INCOMPLETE"
+        if symbol:
+            path += f"&symbol={self._normalize_symbol(symbol)}"
+        
+        resp = self._request("GET", path)
+        if not resp.get("success"):
+            return []
+        
+        orders = []
+        for row in resp["data"].get("rows", []):
+            orders.append(Order(
+                order_id=str(row["order_id"]),
+                symbol=row["symbol"],
+                side=row["side"],
+                order_type=row["type"],
+                price=float(row.get("price")) if row.get("price") else None,
+                size=float(row["quantity"]),
+                status=row["status"],
+                created_at=int(row["created_time"]),
+            ))
+        return orders
+    
+    def cancel(self, order_id: str, symbol: str) -> bool:
+        """
+        Cancel an order.
+        
+        Args:
+            order_id: Order ID to cancel
+            symbol: Symbol of the order
+            
+        Returns:
+            True if cancelled successfully
+        """
+        symbol = self._normalize_symbol(symbol)
+        resp = self._request(
+            "DELETE",
+            f"/v1/order?order_id={order_id}&symbol={symbol}"
+        )
+        return resp.get("success", False)
+    
+    def cancel_all(self, symbol: Optional[str] = None) -> int:
+        """
+        Cancel all open orders.
+        
+        Args:
+            symbol: Cancel only orders for this symbol (optional)
+            
+        Returns:
+            Number of orders cancelled
+        """
+        path = "/v1/orders"
+        if symbol:
+            path += f"?symbol={self._normalize_symbol(symbol)}"
+        
+        resp = self._request("DELETE", path)
+        if resp.get("success"):
+            return resp["data"].get("cancelled_count", 0)
+        return 0
+    
+    # ==================== Market Making ====================
+    
+    def limit_buy(
+        self,
+        symbol: str,
+        price: float,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        post_only: bool = False,
+    ) -> Order:
+        """
+        Place a limit buy order.
+        
+        Args:
+            symbol: Token symbol
+            price: Limit price
+            size: Order size in base asset
+            usd: Order size in USD (alternative)
+            post_only: If True, order will only be maker (cancel if would take)
+            
+        Returns:
+            Order object
+        """
+        return self._place_limit_order(
+            symbol=symbol,
+            side="BUY",
+            price=price,
+            size=size,
+            usd=usd,
+            post_only=post_only,
+        )
+    
+    def limit_sell(
+        self,
+        symbol: str,
+        price: float,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        post_only: bool = False,
+    ) -> Order:
+        """
+        Place a limit sell order.
+        
+        Args:
+            symbol: Token symbol
+            price: Limit price
+            size: Order size in base asset
+            usd: Order size in USD (alternative)
+            post_only: If True, order will only be maker
+            
+        Returns:
+            Order object
+        """
+        return self._place_limit_order(
+            symbol=symbol,
+            side="SELL",
+            price=price,
+            size=size,
+            usd=usd,
+            post_only=post_only,
+        )
+    
+    def _place_limit_order(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        size: Optional[float] = None,
+        usd: Optional[float] = None,
+        post_only: bool = False,
+        reduce_only: bool = False,
+    ) -> Order:
+        """Internal method to place a limit order"""
+        symbol = self._normalize_symbol(symbol)
+        
+        # Validate USD amount
+        if usd is not None:
+            if usd <= 0:
+                raise OrderError(f"USD amount must be positive, got {usd}")
+            if usd > self.MAX_ORDER_USD:
+                raise OrderError(
+                    f"USD amount {usd} exceeds MAX_ORDER_USD ({self.MAX_ORDER_USD}). "
+                    f"Increase Arthur.MAX_ORDER_USD if this is intentional."
+                )
+        
+        # Calculate size from USD if needed
+        if usd and not size:
+            size = usd / price  # Use limit price for size calc
+        
+        if not size:
+            raise OrderError("Must specify either size or usd")
+        
+        # Validate size
+        if size <= 0:
+            raise OrderError(f"Order size must be positive, got {size}")
+        
+        order_type = "POST_ONLY" if post_only else "LIMIT"
+        
+        order_data = {
+            "symbol": symbol,
+            "side": side,
+            "order_type": order_type,
+            "order_quantity": str(size),
+            "order_price": str(price),
+            "reduce_only": reduce_only,
+        }
+        
+        resp = self._request("POST", "/v1/order", data=order_data)
+        
+        if not resp.get("success"):
+            error = resp.get("message", "Unknown error")
+            if "insufficient" in error.lower():
+                raise InsufficientFundsError(error)
+            raise OrderError(error)
+        
+        data = resp["data"]
+        return Order(
+            order_id=str(data["order_id"]),
+            symbol=symbol,
+            side=side,
+            order_type=order_type,
+            price=price,
+            size=size,
+            status=data.get("status", "NEW"),
+            created_at=int(time.time() * 1000),
+        )
+    
+    def orderbook(self, symbol: str, depth: int = 10) -> Dict[str, List]:
+        """
+        Get orderbook for a symbol.
+        
+        Args:
+            symbol: Token symbol
+            depth: Number of levels to return (default 10)
+            
+        Returns:
+            Dict with 'bids' and 'asks' lists of [price, size] pairs
+        """
+        symbol = self._normalize_symbol(symbol)
+        resp = self._request("GET", f"/v1/orderbook/{symbol}", auth=True)
+        
+        if not resp.get("success"):
+            raise ArthurError(f"Failed to get orderbook for {symbol}")
+        
+        data = resp["data"]
+        
+        # Handle both formats: [{price, quantity}] or [[price, qty]]
+        def parse_levels(levels):
+            result = []
+            for level in levels[:depth]:
+                if isinstance(level, dict):
+                    result.append([float(level["price"]), float(level["quantity"])])
+                else:
+                    result.append([float(level[0]), float(level[1])])
+            return result
+        
+        return {
+            "bids": parse_levels(data.get("bids", [])),
+            "asks": parse_levels(data.get("asks", [])),
+            "timestamp": data.get("timestamp", int(time.time() * 1000)),
+        }
+    
+    def spread(self, symbol: str) -> Dict[str, float]:
+        """
+        Get current spread for a symbol.
+        
+        Args:
+            symbol: Token symbol
+            
+        Returns:
+            Dict with best_bid, best_ask, mid, spread_pct, spread_bps
+        """
+        ob = self.orderbook(symbol, depth=1)
+        
+        if not ob["bids"] or not ob["asks"]:
+            raise ArthurError(f"No orderbook data for {symbol}")
+        
+        best_bid = ob["bids"][0][0]
+        best_ask = ob["asks"][0][0]
+        mid = (best_bid + best_ask) / 2
+        spread_abs = best_ask - best_bid
+        spread_pct = (spread_abs / mid) * 100
+        spread_bps = spread_pct * 100
+        
+        return {
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "spread": spread_abs,
+            "spread_pct": spread_pct,
+            "spread_bps": spread_bps,
+        }
+    
+    def get_order(self, order_id: str) -> Optional[Order]:
+        """
+        Get order by ID.
+        
+        Args:
+            order_id: Order ID
+            
+        Returns:
+            Order object or None if not found
+        """
+        resp = self._request("GET", f"/v1/order/{order_id}")
+        
+        if not resp.get("success"):
+            return None
+        
+        row = resp["data"]
+        return Order(
+            order_id=str(row["order_id"]),
+            symbol=row["symbol"],
+            side=row["side"],
+            order_type=row["type"],
+            price=float(row.get("price")) if row.get("price") else None,
+            size=float(row["quantity"]),
+            status=row["status"],
+            created_at=int(row["created_time"]),
+        )
+    
+    def quote(
+        self,
+        symbol: str,
+        bid_price: float,
+        ask_price: float,
+        size: float,
+        cancel_existing: bool = True,
+    ) -> Dict[str, Order]:
+        """
+        Place a two-sided quote (bid + ask).
+        
+        Args:
+            symbol: Token symbol
+            bid_price: Bid (buy) price
+            ask_price: Ask (sell) price
+            size: Size for each side
+            cancel_existing: Cancel existing orders first
+            
+        Returns:
+            Dict with 'bid' and 'ask' Order objects
+        """
+        symbol = self._normalize_symbol(symbol)
+        
+        if cancel_existing:
+            self.cancel_all(symbol)
+        
+        bid_order = self.limit_buy(symbol, price=bid_price, size=size, post_only=True)
+        ask_order = self.limit_sell(symbol, price=ask_price, size=size, post_only=True)
+        
+        return {
+            "bid": bid_order,
+            "ask": ask_order,
+        }
+    
+    # ==================== Convenience ====================
+    
+    def summary(self) -> Dict[str, Any]:
+        """
+        Get account summary including balance, positions, and PnL.
+        
+        Returns:
+            Dict with account summary
+        """
+        positions = self.positions()
+        total_pnl = sum(p.unrealized_pnl for p in positions)
+        
+        return {
+            "balance": self.balance(),
+            "equity": self.equity(),
+            "positions": len(positions),
+            "unrealized_pnl": total_pnl,
+            "position_details": [
+                {
+                    "symbol": p.symbol.replace("PERP_", "").replace("_USDC", ""),
+                    "side": p.side,
+                    "size": p.size,
+                    "entry": p.entry_price,
+                    "mark": p.mark_price,
+                    "pnl": p.unrealized_pnl,
+                    "pnl_pct": p.pnl_percent,
+                }
+                for p in positions
+            ]
+        }
+    
+    def __repr__(self) -> str:
+        return f"Arthur(account_id={self.account_id[:8]}...)" if self.account_id else "Arthur(not authenticated)"
