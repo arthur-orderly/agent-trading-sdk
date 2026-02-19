@@ -6,14 +6,14 @@ with open("README.md", "r", encoding="utf-8") as f:
     long_description = f.read()
 
 setup(
-    name="agent-trading-sdk",
-    version="0.1.0",
+    name="arthur-sdk",
+    version="0.4.0",
     author="Arthur",
     author_email="dev@orderly.network",
     description="Simple trading for AI agents on Orderly Network",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/anthropic/agent-trading-sdk",
+    url="https://github.com/arthur-orderly/agent-trading-sdk",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 3 - Alpha",
@@ -30,6 +30,7 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         "pynacl>=1.5.0",  # For ed25519 signing
+        "httpx>=0.24.0",  # For HTTP requests in integrations
     ],
     extras_require={
         "dev": [
@@ -37,6 +38,20 @@ setup(
             "pytest-asyncio>=0.21",
             "black>=23.0",
             "mypy>=1.0",
+        ],
+        "langchain": [
+            "langchain-core>=0.1.0",
+        ],
+        "crewai": [
+            "crewai>=0.1.0",
+        ],
+        "autogen": [
+            "pyautogen>=0.2.0",
+        ],
+        "all-integrations": [
+            "langchain-core>=0.1.0",
+            "crewai>=0.1.0", 
+            "pyautogen>=0.2.0",
         ],
     },
     entry_points={
